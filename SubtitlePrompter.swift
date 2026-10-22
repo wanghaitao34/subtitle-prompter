@@ -1,0 +1,703 @@
+// 字幕提词器：打开视频后自动匹配同名 SRT，以歌词滚动 + 卡拉 OK 填充的方式显示字幕，方便对着念配音。
+import SwiftUI
+import AVFoundation
+import AppKit
+import NaturalLanguage
+
+let accent = Color(red: 0.19, green: 0.82, blue: 0.55)
+let amber = Color(red: 0.91, green: 0.64, blue: 0.24)
+
+// MARK: - SRT
+
+struct Cue: Identifiable, Equatable {
+    let id: Int
+    let start: Double
+    let end: Double
+    let text: String
+    var duration: Double { max(end - start, 0.001) }
+}
+
+enum SRT {
+    static func parse(_ raw: String) -> [Cue] {
+        let s = raw.replacingOccurrences(of: "\u{FEFF}", with: "")
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        var items: [(Double, Double, String)] = []
+        var lines: [String] = []
+        func flush() {
+            defer { lines.removeAll() }
+            guard let ti = lines.firstIndex(where: { $0.contains("-->") }) else { return }
+            let parts = lines[ti].components(separatedBy: "-->")
+            guard parts.count == 2, let a = time(parts[0]), let b = time(parts[1]) else { return }
+            let text = lines[(ti + 1)...].joined(separator: " ").trimmingCharacters(in: .whitespaces)
+            if !text.isEmpty { items.append((a, b, text)) }
+        }
+        for line in s.components(separatedBy: "\n") {
+            if line.trimmingCharacters(in: .whitespaces).isEmpty { flush() } else { lines.append(line) }
+        }
+        flush()
+        return items.sorted { $0.0 < $1.0 }.enumerated().map { Cue(id: $0.offset, start: $0.element.0, end: $0.element.1, text: $0.element.2) }
+    }
+
+    static func time(_ s: String) -> Double? {
+        let tok = s.trimmingCharacters(in: .whitespaces).split(separator: " ").first.map(String.init) ?? ""
+        let c = tok.replacingOccurrences(of: ",", with: ".").split(separator: ":")
+        guard c.count == 3, let h = Double(c[0]), let m = Double(c[1]), let sec = Double(c[2]) else { return nil }
+        return h * 3600 + m * 60 + sec
+    }
+
+    /// 按顺序找：同目录同名 → 「xx视频」对应的「xx字幕」目录 → 名字规范化后相同 → 编号前缀（如 02_19）相同
+    static func findSubtitle(for video: URL) -> URL? {
+        let fm = FileManager.default
+        let base = video.deletingPathExtension().lastPathComponent
+        let dir = video.deletingLastPathComponent()
+        let parent = dir.deletingLastPathComponent()
+        var dirs = [dir]
+        if dir.lastPathComponent.contains("视频") {
+            dirs.append(parent.appendingPathComponent(dir.lastPathComponent.replacingOccurrences(of: "视频", with: "字幕")))
+        }
+        for name in ["粗剪字幕", "成品字幕", "字幕"] {
+            dirs.append(parent.appendingPathComponent(name))
+            dirs.append(dir.appendingPathComponent(name))
+        }
+        for d in dirs {
+            let u = d.appendingPathComponent(base + ".srt")
+            if fm.fileExists(atPath: u.path) { return u }
+        }
+        var seen = Set<String>()
+        let candidates = dirs.flatMap { (try? fm.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)) ?? [] }
+            .filter { $0.pathExtension.lowercased() == "srt" && seen.insert($0.standardizedFileURL.path).inserted }
+        let key = normalize(base)
+        if let m = candidates.first(where: { normalize($0.deletingPathExtension().lastPathComponent) == key }) { return m }
+        guard let prefix = numberPrefix(base) else { return nil }
+        let same = candidates.filter { numberPrefix($0.deletingPathExtension().lastPathComponent) == prefix }
+        return same.max { commonPrefix(normalize($0.deletingPathExtension().lastPathComponent), key) < commonPrefix(normalize($1.deletingPathExtension().lastPathComponent), key) }
+    }
+
+    static func normalize(_ s: String) -> String {
+        s.lowercased().replacingOccurrences(of: "workbduy", with: "workbuddy")
+            .filter { !$0.isWhitespace && $0 != "_" && $0 != "-" }
+    }
+
+    static func numberPrefix(_ s: String) -> String? {
+        guard let r = s.range(of: #"^\d+_\d+"#, options: .regularExpression) else { return nil }
+        return String(s[r])
+    }
+
+    static func commonPrefix(_ a: String, _ b: String) -> Int {
+        zip(a, b).prefix { $0 == $1 }.count
+    }
+}
+
+// MARK: - 播放
+
+final class Engine: ObservableObject {
+    @Published var cues: [Cue] = []
+    @Published var videoURL: URL?
+    @Published var srtURL: URL?
+    @Published var isPlaying = false
+    @Published var rate: Float = 1 { didSet { applyRate() } }
+    @Published var muted = false { didSet { player?.isMuted = muted } }
+    @Published var message: String?
+    @Published var mediaDuration: Double?
+    @Published var refresh = 0
+    @Published var dropTargeted = false
+
+    private(set) var player: AVPlayer?
+    private var manualBase = 0.0
+    private var manualStart: Date?
+    private var endObserver: Any?
+    private var ticker: Timer?
+
+    init() {
+        ticker = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            guard let self, self.player == nil, self.isPlaying, self.time >= self.duration else { return }
+            self.pause()
+        }
+    }
+
+    var duration: Double {
+        if let d = mediaDuration, d.isFinite, d > 0 { return d }
+        return (cues.last?.end ?? 0) + 2
+    }
+
+    var time: Double {
+        if let p = player {
+            let t = p.currentTime().seconds
+            return t.isFinite ? t : 0
+        }
+        if let s = manualStart { return min(manualBase + Date().timeIntervalSince(s) * Double(rate), duration) }
+        return manualBase
+    }
+
+    var title: String {
+        (videoURL ?? srtURL)?.deletingPathExtension().lastPathComponent ?? "字幕提词器"
+    }
+
+    func activeIndex(at t: Double) -> Int? {
+        cues.firstIndex { $0.start <= t && t < $0.end }
+    }
+
+    func nextIndex(at t: Double) -> Int? {
+        cues.firstIndex { $0.start > t }
+    }
+
+    // MARK: 打开文件
+
+    func open(_ urls: [URL]) {
+        let media = urls.filter { $0.pathExtension.lowercased() != "srt" }
+        let subs = urls.filter { $0.pathExtension.lowercased() == "srt" }
+        if let v = media.first { openMedia(v, autoMatch: subs.isEmpty) }
+        if let s = subs.first { openSRT(s) }
+    }
+
+    func openMedia(_ url: URL, autoMatch: Bool) {
+        pause()
+        if let o = endObserver { NotificationCenter.default.removeObserver(o) }
+        let item = AVPlayerItem(url: url)
+        let p = AVPlayer(playerItem: item)
+        p.isMuted = muted
+        p.actionAtItemEnd = .pause
+        player = p
+        videoURL = url
+        mediaDuration = nil
+        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
+            self?.isPlaying = false
+        }
+        Task { @MainActor in
+            if let d = try? await item.asset.load(.duration) { self.mediaDuration = d.seconds }
+        }
+        guard autoMatch else { return }
+        if let s = SRT.findSubtitle(for: url) {
+            openSRT(s)
+        } else {
+            cues = []
+            srtURL = nil
+            message = "没找到同名字幕，请点「打开」再选一个 SRT 文件"
+        }
+    }
+
+    func openSRT(_ url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) else {
+            message = "读不了这个字幕文件：\(url.lastPathComponent)"
+            return
+        }
+        let parsed = SRT.parse(text)
+        guard !parsed.isEmpty else {
+            message = "这个文件里没有解析出字幕：\(url.lastPathComponent)"
+            return
+        }
+        cues = parsed
+        srtURL = url
+        message = nil
+        if player == nil { manualBase = 0; manualStart = nil }
+        refresh += 1
+    }
+
+    func choose(subtitleOnly: Bool) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = !subtitleOnly
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = subtitleOnly
+            ? [.init(filenameExtension: "srt")!]
+            : [.movie, .audio, .init(filenameExtension: "srt")!]
+        panel.message = subtitleOnly ? "选择 SRT 字幕" : "选择视频（会自动匹配同名 SRT），也可以同时选视频和字幕"
+        if panel.runModal() == .OK { open(panel.urls) }
+    }
+
+    // MARK: 控制
+
+    func play() {
+        if time >= duration - 0.05 { seek(0) }
+        if let p = player { p.playImmediately(atRate: rate) } else { manualStart = Date() }
+        isPlaying = true
+    }
+
+    func pause() {
+        if let p = player { p.pause() } else if manualStart != nil { manualBase = time; manualStart = nil }
+        isPlaying = false
+    }
+
+    func toggle() { isPlaying ? pause() : play() }
+
+    func seek(_ t: Double) {
+        let t = max(0, min(t, duration))
+        if let p = player {
+            p.seek(to: CMTime(seconds: t, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+                DispatchQueue.main.async { self?.refresh += 1 }
+            }
+        } else {
+            manualBase = t
+            if manualStart != nil { manualStart = Date() }
+            refresh += 1
+        }
+    }
+
+    /// 跳到下一句开头（提前 1 秒，好看到倒数）
+    func nextLine() {
+        let t = time
+        if let i = cues.firstIndex(where: { $0.start > t + 0.05 }) { seek(cues[i].start - preroll(i)) }
+    }
+
+    /// 当前句播了超过 1 秒就回到本句开头，否则回到上一句
+    func prevLine() {
+        let t = time
+        if let a = activeIndex(at: t), t - cues[a].start > 1 { seek(cues[a].start - preroll(a)); return }
+        if let i = cues.lastIndex(where: { $0.start < t - 0.05 - 1 }) { seek(cues[i].start - preroll(i)) }
+        else { seek(0) }
+    }
+
+    private func preroll(_ i: Int) -> Double {
+        let prevEnd = i > 0 ? cues[i - 1].end : 0
+        return min(1, max(0, cues[i].start - prevEnd))
+    }
+
+    private func applyRate() {
+        if let p = player { if isPlaying { p.rate = rate } }
+        else if manualStart != nil { manualBase = time; manualStart = Date() }
+    }
+}
+
+// MARK: - 界面
+
+@main
+struct SubtitlePrompterApp: App {
+    @StateObject private var engine = Engine()
+
+    var body: some Scene {
+        WindowGroup("字幕提词器") {
+            ContentView()
+                .environmentObject(engine)
+                .frame(minWidth: 460, minHeight: 560)
+                .onAppear {
+                    let args = CommandLine.arguments.dropFirst().map { URL(fileURLWithPath: $0) }
+                        .filter { FileManager.default.fileExists(atPath: $0.path) }
+                    if !args.isEmpty { engine.open(args) }
+                }
+        }
+        .defaultSize(width: 620, height: 880)
+        .windowStyle(.hiddenTitleBar)
+        .commands {
+            CommandGroup(replacing: .newItem) {
+                Button("打开视频或字幕…") { engine.choose(subtitleOnly: false) }.keyboardShortcut("o")
+                Button("更换字幕…") { engine.choose(subtitleOnly: true) }.keyboardShortcut("o", modifiers: [.command, .shift])
+            }
+        }
+    }
+}
+
+struct ContentView: View {
+    @EnvironmentObject var e: Engine
+    @AppStorage("mirrored") private var mirrored = false
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                HeaderView()
+                if e.cues.isEmpty {
+                    EmptyHint()
+                } else {
+                    TimelineView(.animation(minimumInterval: nil, paused: !e.isPlaying)) { _ in
+                        let t = e.time
+                        let _ = e.refresh
+                        VStack(spacing: 0) {
+                            LyricsList(time: t)
+                            ControlsView(time: t)
+                        }
+                    }
+                }
+            }
+
+            // 镜像：整个画面上下翻转。iPad 平放、顶部朝外时，经提词器玻璃反射后文字就是正的
+            .scaleEffect(x: 1, y: mirrored ? -1 : 1)
+
+            if e.dropTargeted {
+                RoundedRectangle(cornerRadius: 16).stroke(accent, style: StrokeStyle(lineWidth: 3, dash: [10, 6]))
+                    .padding(10).allowsHitTesting(false)
+            }
+        }
+        .preferredColorScheme(.dark)
+        .onDrop(of: [.fileURL], isTargeted: $e.dropTargeted) { providers in
+            let group = DispatchGroup()
+            var urls: [URL] = []
+            let lock = NSLock()
+            for p in providers {
+                group.enter()
+                _ = p.loadObject(ofClass: URL.self) { url, _ in
+                    if let url { lock.lock(); urls.append(url); lock.unlock() }
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) { e.open(urls) }
+            return true
+        }
+    }
+}
+
+struct HeaderView: View {
+    @EnvironmentObject var e: Engine
+    @AppStorage("fontSize") private var fontSize = 30.0
+    @AppStorage("mirrored") private var mirrored = false
+
+    var body: some View {
+        VStack(spacing: 6) {
+            HStack(spacing: 10) {
+                Spacer().frame(width: 64) // 留给左上角红绿灯
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(e.title).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                    if let s = e.srtURL {
+                        Text("字幕：\(s.lastPathComponent) · 共 \(e.cues.count) 句")
+                            .font(.system(size: 11)).foregroundStyle(.white.opacity(0.5)).lineLimit(1)
+                    }
+                }
+                Spacer()
+                Menu {
+                    ForEach([0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5], id: \.self) { r in
+                        Button(r == 1 ? "1×（原速）" : "\(r.formatted())×") { e.rate = Float(r) }
+                    }
+                } label: { Text("\(Double(e.rate).formatted())×") }
+                    .menuStyle(.borderlessButton).fixedSize()
+                    .help("播放速度")
+                IconButton(system: e.muted ? "speaker.slash.fill" : "speaker.wave.2.fill", help: e.muted ? "取消静音" : "静音原声") { e.muted.toggle() }
+                IconButton(system: "textformat.size.smaller", help: "缩小字号") { fontSize = max(18, fontSize - 2) }
+                IconButton(system: "textformat.size.larger", help: "放大字号") { fontSize = min(60, fontSize + 2) }
+                Button { mirrored.toggle() } label: {
+                    Image(systemName: "arrow.up.and.down.righttriangle.up.righttriangle.down")
+                        .foregroundStyle(mirrored ? accent : .primary)
+                        .frame(width: 22, height: 22)
+                }
+                .buttonStyle(.borderless)
+                .keyboardShortcut("m", modifiers: [])
+                .help(mirrored ? "取消镜像（M）" : "镜像显示（M）")
+                IconButton(system: "arrow.up.left.and.arrow.down.right", help: "全屏（F）") {
+                    NSApp.keyWindow?.toggleFullScreen(nil)
+                }
+                .keyboardShortcut("f", modifiers: [])
+                Menu {
+                    Button("打开视频或字幕…") { e.choose(subtitleOnly: false) }
+                    Button("更换字幕…") { e.choose(subtitleOnly: true) }
+                } label: { Image(systemName: "folder") }
+                    .menuStyle(.borderlessButton).fixedSize()
+                    .help("打开")
+            }
+            if let m = e.message {
+                Text(m).font(.system(size: 12)).foregroundStyle(amber)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 8)
+        .background(Color.black)
+    }
+}
+
+struct IconButton: View {
+    let system: String
+    let help: String
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) { Image(systemName: system).frame(width: 22, height: 22) }
+            .buttonStyle(.borderless).help(help)
+    }
+}
+
+struct EmptyHint: View {
+    @EnvironmentObject var e: Engine
+    var body: some View {
+        VStack(spacing: 16) {
+            Spacer()
+            Image(systemName: "music.note.list").font(.system(size: 54)).foregroundStyle(accent)
+            Text("把视频拖进来").font(.system(size: 22, weight: .semibold))
+            Text("会自动找同名 SRT（同目录，或旁边的「粗剪字幕 / 成品字幕」）。\n也可以只拖一个 SRT，按字幕时间轴空跑。")
+                .multilineTextAlignment(.center).font(.system(size: 13)).foregroundStyle(.white.opacity(0.55))
+            Button("打开文件…") { e.choose(subtitleOnly: false) }
+                .buttonStyle(.borderedProminent).tint(accent).controlSize(.large)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+// MARK: 歌词列表
+
+enum Phase { case past, active, upcoming, future }
+
+struct LyricsList: View {
+    @EnvironmentObject var e: Engine
+    @AppStorage("fontSize") private var fontSize = 30.0
+    let time: Double
+
+    var body: some View {
+        let active = e.activeIndex(at: time)
+        let next = e.nextIndex(at: time)
+        // 停在两句之间、且这段停顿有单独一行时，镜头对准停顿行
+        let focus = active ?? next.map { gap(before: $0) >= minGap ? gapID($0) : $0 } ?? max(e.cues.count - 1, 0)
+
+        GeometryReader { geo in
+        // 一行最多能放多宽（减掉左右边距），超过就拆成两行
+        let lineWidth = (geo.size.width - 56).rounded()
+        ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: fontSize * 0.45) {
+                    Color.clear.frame(height: 240)
+                    ForEach(e.cues) { cue in
+                        let g = gap(before: cue.id)
+                        if g >= minGap {
+                            let gapStart = cue.start - g
+                            GapRow(duration: g,
+                                   remaining: (time >= gapStart && time < cue.start) ? cue.start - time : nil,
+                                   isPast: time >= cue.start,
+                                   fontSize: fontSize)
+                                .id(gapID(cue.id))
+                        }
+                        let phase: Phase = cue.id == active ? .active
+                            : (active == nil && cue.id == next) ? .upcoming
+                            : cue.end <= time ? .past : .future
+                        CueRow(cue: cue,
+                               phase: phase,
+                               progress: phase == .active ? min(max((time - cue.start) / cue.duration, 0), 1) : (phase == .past ? 1 : 0),
+                               fontSize: fontSize,
+                               lineWidth: lineWidth)
+                            .id(cue.id)
+                            .contentShape(Rectangle())
+                            .onTapGesture { e.seek(cue.start) }
+                    }
+                    Color.clear.frame(height: 360)
+                }
+                .padding(.horizontal, 24)
+                .frame(maxWidth: .infinity)
+            }
+            .onChange(of: focus) { _, f in
+                withAnimation(.smooth(duration: 0.7)) { proxy.scrollTo(f, anchor: UnitPoint(x: 0.5, y: 0.42)) }
+            }
+            .onAppear { proxy.scrollTo(focus, anchor: UnitPoint(x: 0.5, y: 0.42)) }
+        }
+        }
+        .mask(LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.12),
+                                     .init(color: .black, location: 0.85), .init(color: .clear, location: 1)],
+                             startPoint: .top, endPoint: .bottom))
+    }
+
+    /// 短于这个秒数的停顿不单独显示
+    private let minGap = 1.0
+
+    /// 第 i 句开口前的停顿秒数（第一句从视频开头算起）
+    private func gap(before i: Int) -> Double {
+        e.cues[i].start - (i > 0 ? e.cues[i - 1].end : 0)
+    }
+
+    /// 停顿行用负数 ID，和句子的 ID 区分开
+    private func gapID(_ i: Int) -> Int { -(i + 1) }
+}
+
+/// 所有行都用同一字号排版，当前句用 scaleEffect 从中心放大、其余行缩小变淡，
+/// 这样切换时只有缩放和透明度在动画，不会因为字号、字重变化而跳动
+struct CueRow: View {
+    let cue: Cue
+    let phase: Phase
+    let progress: Double
+    let fontSize: Double
+    let lineWidth: Double
+
+    var body: some View {
+        let lines = LineSplitter.lines(cue.text, size: fontSize, maxWidth: lineWidth)
+        KaraokeText(lines: lines, progress: progress, highlighted: phase == .active, size: fontSize)
+            .opacity(opacity)
+            .scaleEffect(phase == .active ? 1 : 0.74, anchor: .center)
+            .frame(minHeight: fontSize * 1.35)
+            .animation(.smooth(duration: 0.6), value: phase)
+    }
+
+    private var opacity: Double {
+        switch phase {
+        case .active: return 1
+        case .upcoming: return 0.85
+        case .future: return 0.55
+        case .past: return 0.3
+        }
+    }
+}
+
+/// 一句可能拆成一到两行；绿色按字数比例先填第一行、再填第二行
+struct KaraokeText: View {
+    let lines: [String]
+    let progress: Double
+    let highlighted: Bool
+    let size: Double
+
+    var body: some View {
+        let counts = lines.map { Double(max($0.count, 1)) }
+        let total = counts.reduce(0, +)
+        VStack(spacing: size * 0.15) {
+            ForEach(lines.indices, id: \.self) { i in
+                let before = counts[..<i].reduce(0, +)
+                KaraokeLine(text: lines[i],
+                            progress: min(max((progress * total - before) / counts[i], 0), 1),
+                            highlighted: highlighted)
+            }
+        }
+        .font(.system(size: size, weight: .semibold))
+    }
+}
+
+struct KaraokeLine: View {
+    let text: String
+    let progress: Double
+    let highlighted: Bool
+
+    var body: some View {
+        ZStack {
+            Text(text).foregroundStyle(.white.opacity(0.92))
+            // 绿色层一直在，只靠透明度淡入淡出，读完的句子会慢慢褪回白色
+            Text(text).foregroundStyle(accent)
+                .mask(alignment: .leading) {
+                    GeometryReader { g in Rectangle().frame(width: g.size.width * progress) }
+                }
+                .opacity(highlighted ? 1 : 0)
+        }
+        .lineLimit(1)
+        .minimumScaleFactor(0.4)
+    }
+}
+
+/// 一行放不下时拆成两行：只在词与词之间断开（中文用系统分词），优先标点后，两半宽度尽量相等
+enum LineSplitter {
+    static let breakAfter: Set<Character> = ["，", "。", "、", "；", "：", "！", "？", ",", ";", ":", "!", "?", " "]
+    static let noLineEnd: Set<Character> = ["（", "(", "「", "《", "“"]
+    static let noLineStart: Set<Character> = ["，", "。", "、", "；", "：", "！", "？", ",", ".", ";", ":", "!", "?", "）", ")", "」", "》", "”"]
+
+    static func width(_ s: String, _ size: Double) -> Double {
+        (s as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: size, weight: .semibold)]).width
+    }
+
+    static func lines(_ text: String, size: Double, maxWidth: Double) -> [String] {
+        guard maxWidth > 0, width(text, size) > maxWidth else { return [text] }
+        let chars = Array(text)
+        // 分词，记下每个词的起点（按字符下标）
+        var wordStarts = Set<Int>()
+        let tokenizer = NLTokenizer(unit: .word)
+        tokenizer.string = text
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { r, _ in
+            wordStarts.insert(text.distance(from: text.startIndex, to: r.lowerBound))
+            wordStarts.insert(text.distance(from: text.startIndex, to: r.upperBound))
+            return true
+        }
+        var best: (score: Double, left: String, right: String)?
+        for i in 1..<chars.count {
+            let a = chars[i - 1], b = chars[i]
+            if !wordStarts.contains(i) && !breakAfter.contains(a) { continue }
+            if isWordChar(a) && isWordChar(b) { continue }
+            if noLineStart.contains(b) || noLineEnd.contains(a) { continue }
+            let left = String(chars[..<i]).trimmingCharacters(in: .whitespaces)
+            let right = String(chars[i...]).trimmingCharacters(in: .whitespaces)
+            guard !left.isEmpty, !right.isEmpty else { continue }
+            let wl = width(left, size), wr = width(right, size)
+            var score = abs(wl - wr) / (wl + wr)
+            if breakAfter.contains(a) { score -= 0.3 }
+            if best == nil || score < best!.score { best = (score, left, right) }
+        }
+        guard let best else { return [text] }
+        return [best.left, best.right]
+    }
+
+    private static func isWordChar(_ c: Character) -> Bool {
+        c.isASCII && (c.isLetter || c.isNumber)
+    }
+}
+
+/// 两句之间的停顿：条的长度和停顿秒数成正比（1 秒 ≈ 40 像素），提前就能看出要等多久。
+/// 停顿进行中，条从右往左缩短；最后 1 秒变成绿色，提示准备开口。
+struct GapRow: View {
+    let duration: Double
+    let remaining: Double?
+    let isPast: Bool
+    let fontSize: Double
+
+    var body: some View {
+        let active = remaining != nil
+        let width = min(max(duration * 40 * fontSize / 30, 28), 420)
+        let fraction = remaining.map { min(max($0 / duration, 0), 1) } ?? (isPast ? 0 : 1)
+        let color: Color = !active ? .white.opacity(isPast ? 0.25 : 0.45)
+            : (remaining! <= 1 ? accent : amber)
+        HStack(spacing: 10) {
+            Image(systemName: "pause.fill").font(.system(size: 11))
+            ZStack(alignment: .leading) {
+                Capsule().fill(.white.opacity(0.1))
+                Capsule().fill(color).frame(width: width * fraction)
+            }
+            .frame(width: width, height: active ? 8 : 5)
+            // 3 秒以上的长停顿才写秒数，短停顿只看横条
+            if duration >= 3 {
+                Text("停顿 \(Int(duration.rounded())) 秒")
+                    .font(.system(size: 13, weight: active ? .semibold : .regular).monospacedDigit())
+            }
+        }
+        .foregroundStyle(color)
+        .scaleEffect(active ? 1.15 : 1)
+        .padding(.vertical, 4)
+        .animation(.smooth(duration: 0.5), value: active)
+        .animation(.easeInOut(duration: 0.3), value: remaining.map { $0 <= 1 })
+    }
+}
+
+// MARK: 底部控制
+
+struct ControlsView: View {
+    @EnvironmentObject var e: Engine
+    let time: Double
+
+    var body: some View {
+        VStack(spacing: 12) {
+            HStack(spacing: 12) {
+                Text(fmt(time)).monospacedDigit()
+                Slider(value: Binding(get: { min(time, e.duration) }, set: { e.seek($0) }), in: 0...max(e.duration, 0.1))
+                    .tint(accent)
+                    .controlSize(.small)
+                Text(fmt(e.duration)).monospacedDigit()
+            }
+            .font(.system(size: 12))
+            .foregroundStyle(.white.opacity(0.7))
+
+            HStack(spacing: 34) {
+                RoundControl(system: "backward.end.fill", size: 40) { e.prevLine() }
+                    .keyboardShortcut(.leftArrow, modifiers: [])
+                    .help("上一句（←）")
+                RoundControl(system: e.isPlaying ? "pause.fill" : "play.fill", size: 58) { e.toggle() }
+                    .keyboardShortcut(.space, modifiers: [])
+                    .help("播放 / 暂停（空格）")
+                RoundControl(system: "forward.end.fill", size: 40) { e.nextLine() }
+                    .keyboardShortcut(.rightArrow, modifiers: [])
+                    .help("下一句（→）")
+            }
+        }
+        .padding(.horizontal, 22)
+        .padding(.top, 14)
+        .padding(.bottom, 20)
+        .background(Color.black)
+    }
+
+    private func fmt(_ t: Double) -> String {
+        let s = Int(max(t, 0))
+        return String(format: "%02d:%02d", s / 60, s % 60)
+    }
+}
+
+struct RoundControl: View {
+    let system: String
+    let size: Double
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Circle().stroke(accent, lineWidth: 2)
+                Image(systemName: system).font(.system(size: size * 0.36)).foregroundStyle(accent)
+            }
+            .frame(width: size, height: size)
+            .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+    }
+}
