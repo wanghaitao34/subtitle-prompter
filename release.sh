@@ -55,9 +55,9 @@ notarize() {
   local file="$1" out
   out=$(xcrun notarytool submit "$file" --keychain-profile "$NOTARY_PROFILE" --wait --output-format json)
   local sid=$(print -r -- "$out" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')
-  local status=$(print -r -- "$out" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')
-  echo "公证结果：$status（$sid）"
-  if [[ "$status" != "Accepted" ]]; then
+  local result=$(print -r -- "$out" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin).get("status",""))')
+  echo "公证结果：$result（$sid）"
+  if [[ "$result" != "Accepted" ]]; then
     [[ -n "$sid" ]] && xcrun notarytool log "$sid" --keychain-profile "$NOTARY_PROFILE"
     fail "公证没有通过，见上面的日志"
   fi
