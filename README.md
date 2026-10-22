@@ -14,6 +14,27 @@
 
 会在当前目录生成 `字幕提词器.app`。要求 macOS 14 及以上（Apple 芯片）。
 
+## 发布（签名 + 公证 + DMG）
+
+不上架 App Store，用 Developer ID 签名并经苹果公证，别人下载后双击就能打开。
+
+第一次发布前：
+
+1. 在 developer.apple.com 申请「Developer ID Application」证书，装进钥匙串。
+2. 在 account.apple.com 生成一个 App 专用密码，然后运行一次（按提示输入 Apple ID、Team ID、App 专用密码）：
+
+   ```bash
+   xcrun notarytool store-credentials subtitle-prompter-notary
+   ```
+
+之后每次发布：
+
+```bash
+./release.sh
+```
+
+产物是 `dist/字幕提词器-<版本>.dmg`。版本号在 `build.sh` 的 `CFBundleShortVersionString` 里改。只想检查打包流程时用 `./release.sh --unsigned`（不签名、不公证）。
+
 ## 使用
 
 **放入视频**
