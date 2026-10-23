@@ -3,6 +3,7 @@ import SwiftUI
 import AVFoundation
 import AppKit
 import NaturalLanguage
+import UniformTypeIdentifiers
 
 let accent = Color(red: 0.19, green: 0.82, blue: 0.55)
 let amber = Color(red: 0.91, green: 0.64, blue: 0.24)
@@ -48,25 +49,37 @@ enum SRT {
 
     /// 按顺序找：同目录同名 → 「xx视频」对应的「xx字幕」目录 → 名字规范化后相同 → 编号前缀（如 02_19）相同
     static func findSubtitle(for video: URL) -> URL? {
+        findCompanion(for: video, exts: ["srt"], folderWord: "字幕")
+    }
+
+    /// 没有字幕时找同名台词（.txt / .md），目录换成「文稿」「台词」
+    static func findScript(for video: URL) -> URL? {
+        findCompanion(for: video, exts: ["txt", "md"], folderWord: "文稿")
+            ?? findCompanion(for: video, exts: ["txt", "md"], folderWord: "台词")
+    }
+
+    static func findCompanion(for video: URL, exts: [String], folderWord: String) -> URL? {
         let fm = FileManager.default
         let base = video.deletingPathExtension().lastPathComponent
         let dir = video.deletingLastPathComponent()
         let parent = dir.deletingLastPathComponent()
         var dirs = [dir]
         if dir.lastPathComponent.contains("视频") {
-            dirs.append(parent.appendingPathComponent(dir.lastPathComponent.replacingOccurrences(of: "视频", with: "字幕")))
+            dirs.append(parent.appendingPathComponent(dir.lastPathComponent.replacingOccurrences(of: "视频", with: folderWord)))
         }
-        for name in ["粗剪字幕", "成品字幕", "字幕"] {
+        for name in ["粗剪" + folderWord, "成品" + folderWord, folderWord] {
             dirs.append(parent.appendingPathComponent(name))
             dirs.append(dir.appendingPathComponent(name))
         }
         for d in dirs {
-            let u = d.appendingPathComponent(base + ".srt")
-            if fm.fileExists(atPath: u.path) { return u }
+            for ext in exts {
+                let u = d.appendingPathComponent(base + "." + ext)
+                if fm.fileExists(atPath: u.path) { return u }
+            }
         }
         var seen = Set<String>()
         let candidates = dirs.flatMap { (try? fm.contentsOfDirectory(at: $0, includingPropertiesForKeys: nil)) ?? [] }
-            .filter { $0.pathExtension.lowercased() == "srt" && seen.insert($0.standardizedFileURL.path).inserted }
+            .filter { exts.contains($0.pathExtension.lowercased()) && seen.insert($0.standardizedFileURL.path).inserted }
         let key = normalize(base)
         if let m = candidates.first(where: { normalize($0.deletingPathExtension().lastPathComponent) == key }) { return m }
         guard let prefix = numberPrefix(base) else { return nil }
@@ -87,6 +100,185 @@ enum SRT {
     static func commonPrefix(_ a: String, _ b: String) -> Int {
         zip(a, b).prefix { $0 == $1 }.count
     }
+
+    static func format(_ cues: [Cue]) -> String {
+        func ts(_ t: Double) -> String {
+            let ms = Int((max(t, 0) * 1000).rounded())
+            return String(format: "%02d:%02d:%02d,%03d", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000)
+        }
+        return cues.enumerated().map { i, c in "\(i + 1)\n\(ts(c.start)) --> \(ts(c.end))\n\(c.text)\n" }
+            .joined(separator: "\n")
+    }
+}
+
+// MARK: - 台词 → 时间码
+
+/// 把没有时间码的台词按口播节奏估出时间：切成 8～15 字的字幕行，按语速算时长，在标点、段落和【停顿】处留出停顿
+enum ScriptTimer {
+    static let maxUnits = 15.0, minDuration = 1.2, startAt = 0.5
+    static let pauseComma = 0.2, pauseSentence = 0.5, pauseColon = 0.3, pauseParagraph = 1.2, pauseMarker = 1.5, pauseTransition = 0.3
+    static let transitions = ["接下来", "首先", "其次", "然后", "最后", "另外", "总结一下", "总的来说", "那么"]
+
+    /// 念起来的分量：汉字、数字每个 1，英文单词每个 2，标点和空格不算
+    static func units(_ s: String) -> Double {
+        var u = 0.0, inWord = false
+        for ch in s {
+            if ch.isASCII && ch.isLetter {
+                if !inWord { u += 2; inWord = true }
+            } else {
+                inWord = false
+                if ch.isLetter || ch.isNumber { u += 1 }
+            }
+        }
+        return u
+    }
+
+    /// 去掉 Markdown 记号（加粗、标题、引用、列表），保留文字
+    static func plainText(_ md: String) -> String {
+        md.replacingOccurrences(of: "\r\n", with: "\n").components(separatedBy: "\n").map { line -> String in
+            var l = line.trimmingCharacters(in: .whitespaces)
+            if l.range(of: #"^(-{3,}|\*{3,}|_{3,})$"#, options: .regularExpression) != nil { return "" }
+            l = l.replacingOccurrences(of: #"^(#{1,6}|>|[-*+]|\d+\.)\s+"#, with: "", options: .regularExpression)
+            return l.replacingOccurrences(of: "**", with: "").replacingOccurrences(of: "__", with: "")
+        }.joined(separator: "\n")
+    }
+
+    static func cues(from raw: String, rate: Double) -> [Cue] {
+        // 1. 分段：空行或 --- 分隔
+        var paragraphs: [String] = [], buf: [String] = []
+        for line in plainText(raw).components(separatedBy: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty { if !buf.isEmpty { paragraphs.append(join(buf)); buf = [] } } else { buf.append(t) }
+        }
+        if !buf.isEmpty { paragraphs.append(join(buf)) }
+
+        // 2. 每段按标点切成小句，记下每句后面停多久
+        var clauses: [(text: String, pause: Double)] = []
+        let marker = try! NSRegularExpression(pattern: #"【\s*停顿\s*(?:([0-9.]+)\s*秒)?\s*】"#)
+        for para in paragraphs {
+            var cur = ""
+            func emit(_ pause: Double) {
+                let t = cur.trimmingCharacters(in: .whitespaces)
+                cur = ""
+                if !t.isEmpty && units(t) > 0 { clauses.append((t, pause)) }
+                else if !clauses.isEmpty { clauses[clauses.count - 1].pause = max(clauses[clauses.count - 1].pause, pause) }
+            }
+            // 先把【停顿】换成占位符，扫描时再处理
+            let ns = para as NSString
+            var pieces: [(String, Double?)] = []
+            var last = 0
+            for m in marker.matches(in: para, range: NSRange(location: 0, length: ns.length)) {
+                pieces.append((ns.substring(with: NSRange(location: last, length: m.range.location - last)), nil))
+                let secs = m.range(at: 1).location != NSNotFound ? Double(ns.substring(with: m.range(at: 1))) : nil
+                pieces.append(("", secs ?? pauseMarker))
+                last = m.range.location + m.range.length
+            }
+            pieces.append((ns.substring(from: last), nil))
+
+            for (text, markerPause) in pieces {
+                if let p = markerPause { emit(p); continue }
+                let chars = Array(text)
+                for (i, ch) in chars.enumerated() {
+                    let next: Character? = i + 1 < chars.count ? chars[i + 1] : nil
+                    let prev: Character? = i > 0 ? chars[i - 1] : nil
+                    let asciiBreak = next == nil || next == " "
+                    switch ch {
+                    case "，": emit(pauseComma)
+                    case "。": emit(pauseSentence)
+                    case "？", "！": cur.append(ch); emit(pauseSentence)
+                    case "；", "：": emit(pauseColon)
+                    case ",": if asciiBreak { emit(pauseComma) } else { cur.append(ch) }
+                    case ";": if asciiBreak { emit(pauseColon) } else { cur.append(ch) }
+                    case ":": if asciiBreak { emit(pauseColon) } else { cur.append(ch) }
+                    case "?", "!": if asciiBreak { cur.append(ch); emit(pauseSentence) } else { cur.append(ch) }
+                    case ".": if asciiBreak && !(prev?.isNumber ?? false) { emit(pauseSentence) } else { cur.append(ch) }
+                    default: cur.append(ch)
+                    }
+                }
+            }
+            emit(pauseParagraph)
+            if !clauses.isEmpty { clauses[clauses.count - 1].pause = max(clauses[clauses.count - 1].pause, pauseParagraph) }
+        }
+
+        // 3. 「这节课，」「接下来，」这种很短的小句并到下一句里，免得一行只有两三个字
+        var merged: [(text: String, pause: Double)] = []
+        var i = 0
+        while i < clauses.count {
+            var c = clauses[i]
+            while c.pause <= pauseColon, units(c.text) < 5, i + 1 < clauses.count,
+                  units(c.text) + units(clauses[i + 1].text) <= maxUnits {
+                i += 1
+                c = (c.text + (c.pause == pauseColon ? "：" : "，") + clauses[i].text, clauses[i].pause)
+            }
+            merged.append(c)
+            i += 1
+        }
+        clauses = merged
+
+        // 4. 太长的小句再按词切成几行，行与行之间不停顿
+        var lines: [(text: String, pause: Double)] = []
+        for c in clauses {
+            let parts = split(c.text)
+            for (i, part) in parts.enumerated() { lines.append((part, i == parts.count - 1 ? c.pause : 0)) }
+        }
+        // 转场词前多停一下
+        for i in 1..<max(lines.count, 1) where transitions.contains(where: { lines[i].text.hasPrefix($0) }) {
+            lines[i - 1].pause += pauseTransition
+        }
+
+        // 5. 逐行累加时间
+        var t = startAt
+        var out: [Cue] = []
+        for (i, l) in lines.enumerated() {
+            let d = max(minDuration, units(l.text) / max(rate, 0.5))
+            out.append(Cue(id: i, start: t, end: t + d, text: l.text))
+            t += d + l.pause
+        }
+        return out
+    }
+
+    /// 多行合成一段：中文之间直接连，英文之间补空格
+    private static func join(_ lines: [String]) -> String {
+        lines.dropFirst().reduce(lines[0]) { acc, l in
+            (acc.last?.isASCII ?? false) && (l.first?.isASCII ?? false) ? acc + " " + l : acc + l
+        }
+    }
+
+    /// 超过 15 个字的句子在词与词之间切开，最后一段太短就并回上一行
+    private static func split(_ text: String) -> [String] {
+        guard units(text) > maxUnits else { return [text] }
+        var starts = Set<Int>()
+        let tok = NLTokenizer(unit: .word)
+        tok.string = text
+        tok.enumerateTokens(in: text.startIndex..<text.endIndex) { r, _ in
+            starts.insert(text.distance(from: text.startIndex, to: r.lowerBound))
+            starts.insert(text.distance(from: text.startIndex, to: r.upperBound))
+            return true
+        }
+        let chars = Array(text)
+        var parts: [String] = [], from = 0
+        while from < chars.count {
+            let rest = String(chars[from...])
+            if units(rest) <= maxUnits { parts.append(rest); break }
+            // 平均分：总共要分几行，这一行就取差不多 1/n
+            let n = (units(rest) / maxUnits).rounded(.up)
+            let target = units(rest) / n
+            var best = -1, bestDiff = Double.infinity
+            for i in (from + 1)..<chars.count where starts.contains(i) || chars[i - 1] == " " {
+                let u = units(String(chars[from..<i]))
+                if u > maxUnits { break }
+                if abs(u - target) < bestDiff { bestDiff = abs(u - target); best = i }
+            }
+            if best < 0 { best = min(from + Int(maxUnits), chars.count) }
+            parts.append(String(chars[from..<best]).trimmingCharacters(in: .whitespaces))
+            from = best
+        }
+        if parts.count > 1, units(parts.last!) < 4, units(parts[parts.count - 2] + parts.last!) <= 18 {
+            let tail = parts.removeLast()
+            parts[parts.count - 1] += tail
+        }
+        return parts.filter { !$0.isEmpty }
+    }
 }
 
 // MARK: - 播放
@@ -102,6 +294,15 @@ final class Engine: ObservableObject {
     @Published var mediaDuration: Double?
     @Published var refresh = 0
     @Published var dropTargeted = false
+    /// 从台词估出来的时间码：记下原文和语速，改语速时重新算
+    @Published var scriptURL: URL?
+    @Published var scriptText: String?
+    @Published var speechRate: Double = UserDefaults.standard.object(forKey: "speechRate") as? Double ?? 4.5 {
+        didSet {
+            UserDefaults.standard.set(speechRate, forKey: "speechRate")
+            if let s = scriptText { cues = ScriptTimer.cues(from: s, rate: speechRate); refresh += 1 }
+        }
+    }
 
     private(set) var player: AVPlayer?
     private var manualBase = 0.0
@@ -131,7 +332,8 @@ final class Engine: ObservableObject {
     }
 
     var title: String {
-        (videoURL ?? srtURL)?.deletingPathExtension().lastPathComponent ?? "字幕提词器"
+        (videoURL ?? srtURL ?? scriptURL)?.deletingPathExtension().lastPathComponent
+            ?? (scriptText != nil ? "粘贴的台词" : "字幕提词器")
     }
 
     func activeIndex(at t: Double) -> Int? {
@@ -144,11 +346,15 @@ final class Engine: ObservableObject {
 
     // MARK: 打开文件
 
+    static let scriptExts: Set<String> = ["txt", "md", "markdown"]
+
     func open(_ urls: [URL]) {
-        let media = urls.filter { $0.pathExtension.lowercased() != "srt" }
-        let subs = urls.filter { $0.pathExtension.lowercased() == "srt" }
-        if let v = media.first { openMedia(v, autoMatch: subs.isEmpty) }
-        if let s = subs.first { openSRT(s) }
+        let ext = { (u: URL) in u.pathExtension.lowercased() }
+        let subs = urls.filter { ext($0) == "srt" }
+        let scripts = urls.filter { Engine.scriptExts.contains(ext($0)) }
+        let media = urls.filter { ext($0) != "srt" && !Engine.scriptExts.contains(ext($0)) }
+        if let v = media.first { openMedia(v, autoMatch: subs.isEmpty && scripts.isEmpty) }
+        if let s = subs.first { openSRT(s) } else if let s = scripts.first { openScript(s) }
     }
 
     func openMedia(_ url: URL, autoMatch: Bool) {
@@ -170,10 +376,14 @@ final class Engine: ObservableObject {
         guard autoMatch else { return }
         if let s = SRT.findSubtitle(for: url) {
             openSRT(s)
+        } else if let s = SRT.findScript(for: url) {
+            openScript(s)
         } else {
             cues = []
             srtURL = nil
-            message = "没找到同名字幕，请点「打开」再选一个 SRT 文件"
+            scriptURL = nil
+            scriptText = nil
+            message = "没找到同名字幕或台词，请点「打开」选一个 SRT 或台词文件"
         }
     }
 
@@ -190,19 +400,75 @@ final class Engine: ObservableObject {
         }
         cues = parsed
         srtURL = url
+        scriptURL = nil
+        scriptText = nil
         message = nil
         if player == nil { manualBase = 0; manualStart = nil }
         refresh += 1
+    }
+
+    /// 读台词文件，按当前语速估出时间码
+    func openScript(_ url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) else {
+            message = "读不了这个台词文件：\(url.lastPathComponent)"
+            return
+        }
+        loadScript(text, from: url)
+    }
+
+    /// 从剪贴板粘贴台词
+    func pasteScript() {
+        guard let text = NSPasteboard.general.string(forType: .string),
+              !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            message = "剪贴板里没有文字"
+            return
+        }
+        loadScript(text, from: nil)
+    }
+
+    private func loadScript(_ text: String, from url: URL?) {
+        let generated = ScriptTimer.cues(from: text, rate: speechRate)
+        guard !generated.isEmpty else {
+            message = "台词里没有可以念的文字"
+            return
+        }
+        scriptText = text
+        scriptURL = url
+        srtURL = nil
+        cues = generated
+        message = nil
+        if player == nil { manualBase = 0; manualStart = nil }
+        refresh += 1
+    }
+
+    /// 把当前时间码存成 SRT（默认放在台词旁边，同名）
+    func exportSRT() {
+        guard !cues.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.init(filenameExtension: "srt")!]
+        panel.nameFieldStringValue = title + ".srt"
+        if let dir = (scriptURL ?? videoURL ?? srtURL)?.deletingLastPathComponent() { panel.directoryURL = dir }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try SRT.format(cues).write(to: url, atomically: true, encoding: .utf8)
+            message = "已导出：\(url.lastPathComponent)"
+        } catch {
+            message = "导出失败：\(error.localizedDescription)"
+        }
     }
 
     func choose(subtitleOnly: Bool) {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = !subtitleOnly
         panel.canChooseDirectories = false
+        let textTypes = Engine.scriptExts.compactMap { UTType(filenameExtension: $0) } + [.plainText]
         panel.allowedContentTypes = subtitleOnly
-            ? [.init(filenameExtension: "srt")!]
-            : [.movie, .audio, .init(filenameExtension: "srt")!]
-        panel.message = subtitleOnly ? "选择 SRT 字幕" : "选择视频（会自动匹配同名 SRT），也可以同时选视频和字幕"
+            ? [.init(filenameExtension: "srt")!] + textTypes
+            : [.movie, .audio, .init(filenameExtension: "srt")!] + textTypes
+        panel.message = subtitleOnly
+            ? "选择 SRT 字幕，或没有时间码的台词（.txt / .md，会自动估出时间码）"
+            : "选择视频（会自动匹配同名 SRT 或台词），也可以同时选视频和字幕"
         if panel.runModal() == .OK { open(panel.urls) }
     }
 
@@ -281,7 +547,10 @@ struct SubtitlePrompterApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("打开视频或字幕…") { engine.choose(subtitleOnly: false) }.keyboardShortcut("o")
-                Button("更换字幕…") { engine.choose(subtitleOnly: true) }.keyboardShortcut("o", modifiers: [.command, .shift])
+                Button("更换字幕或台词…") { engine.choose(subtitleOnly: true) }.keyboardShortcut("o", modifiers: [.command, .shift])
+                Button("粘贴台词，自动生成时间码") { engine.pasteScript() }.keyboardShortcut("v", modifiers: [.command, .shift])
+                Divider()
+                Button("导出 SRT…") { engine.exportSRT() }.keyboardShortcut("s").disabled(engine.cues.isEmpty)
             }
         }
     }
@@ -351,9 +620,21 @@ struct HeaderView: View {
                     if let s = e.srtURL {
                         Text("字幕：\(s.lastPathComponent) · 共 \(e.cues.count) 句")
                             .font(.system(size: 11)).foregroundStyle(.white.opacity(0.5)).lineLimit(1)
+                    } else if e.scriptText != nil {
+                        Text("\(e.scriptURL.map { "台词：" + $0.lastPathComponent } ?? "粘贴的台词") · 估算时间码 · 共 \(e.cues.count) 句")
+                            .font(.system(size: 11)).foregroundStyle(.white.opacity(0.5)).lineLimit(1)
                     }
                 }
                 Spacer()
+                if e.scriptText != nil {
+                    Menu {
+                        ForEach([3.0, 3.5, 4.0, 4.5, 5.0, 5.5], id: \.self) { r in
+                            Button("\(r.formatted()) 字/秒" + (r == 4.5 ? "（默认）" : "")) { e.speechRate = r }
+                        }
+                    } label: { Text("\(e.speechRate.formatted()) 字/秒") }
+                        .menuStyle(.borderlessButton).fixedSize()
+                        .help("估算时间码用的语速：念不完就调低，念完了字幕还没走完就调高")
+                }
                 Menu {
                     ForEach([0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5], id: \.self) { r in
                         Button(r == 1 ? "1×（原速）" : "\(r.formatted())×") { e.rate = Float(r) }
@@ -378,7 +659,10 @@ struct HeaderView: View {
                 .keyboardShortcut("f", modifiers: [])
                 Menu {
                     Button("打开视频或字幕…") { e.choose(subtitleOnly: false) }
-                    Button("更换字幕…") { e.choose(subtitleOnly: true) }
+                    Button("更换字幕或台词…") { e.choose(subtitleOnly: true) }
+                    Button("粘贴台词，自动生成时间码") { e.pasteScript() }
+                    Divider()
+                    Button("导出 SRT…") { e.exportSRT() }.disabled(e.cues.isEmpty)
                 } label: { Image(systemName: "folder") }
                     .menuStyle(.borderlessButton).fixedSize()
                     .help("打开")
@@ -410,11 +694,15 @@ struct EmptyHint: View {
         VStack(spacing: 16) {
             Spacer()
             Image(systemName: "music.note.list").font(.system(size: 54)).foregroundStyle(accent)
-            Text("把视频拖进来").font(.system(size: 22, weight: .semibold))
-            Text("会自动找同名 SRT（同目录，或旁边的「粗剪字幕 / 成品字幕」）。\n也可以只拖一个 SRT，按字幕时间轴空跑。")
+            Text("把视频、字幕或台词拖进来").font(.system(size: 22, weight: .semibold))
+            Text("视频会自动找同名 SRT；没有字幕就找同名台词（.txt / .md）。\n没有时间码的台词会按语速自动估出时间码，停顿也会算进去。")
                 .multilineTextAlignment(.center).font(.system(size: 13)).foregroundStyle(.white.opacity(0.55))
-            Button("打开文件…") { e.choose(subtitleOnly: false) }
-                .buttonStyle(.borderedProminent).tint(accent).controlSize(.large)
+            HStack(spacing: 12) {
+                Button("打开文件…") { e.choose(subtitleOnly: false) }
+                    .buttonStyle(.borderedProminent).tint(accent).controlSize(.large)
+                Button("粘贴台词") { e.pasteScript() }
+                    .buttonStyle(.bordered).controlSize(.large)
+            }
             Spacer()
         }
         .frame(maxWidth: .infinity)
