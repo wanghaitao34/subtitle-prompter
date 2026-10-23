@@ -1,0 +1,5 @@
+Canva 素材 ID（选定后用来导出原图）
+A_精修质感 MAHYzsGhgP0
+B_停顿提示 MAHYziGlMdA
+C_提词器倒影 MAHYzhphNJc
+D_极简进度条 MAHYznVvCzs

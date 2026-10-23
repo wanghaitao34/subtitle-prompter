@@ -7,7 +7,7 @@
 <p align="center">把 SRT 字幕变成会跟着时间走的提词器，配音、录口播时照着念就行。</p>
 
 <p align="center">
-  <a href="https://github.com/wanghaitao34/subtitle-prompter/releases/latest/download/SubtitlePrompter-1.1.dmg"><b>⬇︎ 下载 macOS 版（1.1）</b></a>
+  <a href="https://github.com/wanghaitao34/subtitle-prompter/releases/latest/download/SubtitlePrompter-1.1.1.dmg"><b>⬇︎ 下载 macOS 版（1.1.1）</b></a>
 </p>
 
 ---
@@ -23,7 +23,7 @@
 
 ## 安装
 
-1. 下载 [字幕提词器 1.1](https://github.com/wanghaitao34/subtitle-prompter/releases/latest/download/SubtitlePrompter-1.1.dmg)。
+1. 下载 [字幕提词器 1.1.1](https://github.com/wanghaitao34/subtitle-prompter/releases/latest/download/SubtitlePrompter-1.1.1.dmg)。
 2. 双击打开下载的 DMG 文件，把「字幕提词器」拖进「应用程序」文件夹。
 3. 在「应用程序」里双击打开。第一次打开时，系统会问你「是否要打开从互联网下载的 App」，点「打开」就行。
 
@@ -37,7 +37,7 @@ App 已经通过苹果公证，不会出现「无法验证开发者」的警告�
 
 - 把视频拖进窗口，App 会自动找**同名的 SRT 字幕**。
   比如视频是 `第一课.mp4`，就找同一个文件夹里的 `第一课.srt`；也会去旁边叫「字幕」的文件夹里找（视频放在「XX视频」文件夹时，也会找「XX字幕」文件夹）。
-- 没找到字幕时，点右上角的文件夹图标 →「更换字幕…」，手动选一个 SRT 文件。
+- 没找到字幕时，点右上角的文件夹图标 →「更换字幕…」，手动选一个 SRT 或台词文件。
 - 只有字幕、没有视频也可以：直接把 SRT 拖进来，它会按字幕的时间自己往下走。
 
 ### 2. 只有台词、没有时间码？
@@ -68,7 +68,7 @@ App 已经通过苹果公证，不会出现「无法验证开发者」的警告�
 - **两个「A」**：缩小 / 放大字号。
 - **上下箭头**：镜像（上下翻转），给提词器用，快捷键 M。
 - **全屏**：快捷键 F。
-- **文件夹**：打开视频、更换字幕或台词、粘贴台词、导出 SRT。
+- **文件夹**：打开…、更换字幕…、粘贴台词、导出 SRT…
 
 字号和镜像设置会自动记住，下次打开不用重新调。
 

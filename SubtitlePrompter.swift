@@ -546,9 +546,9 @@ struct SubtitlePrompterApp: App {
         .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
-                Button("打开视频或字幕…") { engine.choose(subtitleOnly: false) }.keyboardShortcut("o")
-                Button("更换字幕或台词…") { engine.choose(subtitleOnly: true) }.keyboardShortcut("o", modifiers: [.command, .shift])
-                Button("粘贴台词，自动生成时间码") { engine.pasteScript() }.keyboardShortcut("v", modifiers: [.command, .shift])
+                Button("打开…") { engine.choose(subtitleOnly: false) }.keyboardShortcut("o")
+                Button("更换字幕…") { engine.choose(subtitleOnly: true) }.keyboardShortcut("o", modifiers: [.command, .shift])
+                Button("粘贴台词") { engine.pasteScript() }.keyboardShortcut("v", modifiers: [.command, .shift])
                 Divider()
                 Button("导出 SRT…") { engine.exportSRT() }.keyboardShortcut("s").disabled(engine.cues.isEmpty)
             }
@@ -658,11 +658,12 @@ struct HeaderView: View {
                 }
                 .keyboardShortcut("f", modifiers: [])
                 Menu {
-                    Button("打开视频或字幕…") { e.choose(subtitleOnly: false) }
-                    Button("更换字幕或台词…") { e.choose(subtitleOnly: true) }
-                    Button("粘贴台词，自动生成时间码") { e.pasteScript() }
+                    Button { e.choose(subtitleOnly: false) } label: { Label("打开…", systemImage: "folder") }
+                    Button { e.choose(subtitleOnly: true) } label: { Label("更换字幕…", systemImage: "captions.bubble") }
+                    Button { e.pasteScript() } label: { Label("粘贴台词", systemImage: "doc.on.clipboard") }
                     Divider()
-                    Button("导出 SRT…") { e.exportSRT() }.disabled(e.cues.isEmpty)
+                    Button { e.exportSRT() } label: { Label("导出 SRT…", systemImage: "square.and.arrow.up") }
+                        .disabled(e.cues.isEmpty)
                 } label: { Image(systemName: "folder") }
                     .menuStyle(.borderlessButton).fixedSize()
                     .help("打开")
@@ -693,7 +694,7 @@ struct EmptyHint: View {
     var body: some View {
         VStack(spacing: 16) {
             Spacer()
-            Image(systemName: "music.note.list").font(.system(size: 54)).foregroundStyle(accent)
+            VideoCaptionGlyph().frame(width: 96, height: 70)
             Text("把视频、字幕或台词拖进来").font(.system(size: 22, weight: .semibold))
             Text("视频会自动找同名 SRT；没有字幕就找同名台词（.txt / .md）。\n没有时间码的台词会按语速自动估出时间码，停顿也会算进去。")
                 .multilineTextAlignment(.center).font(.system(size: 13)).foregroundStyle(.white.opacity(0.55))
@@ -706,6 +707,28 @@ struct EmptyHint: View {
             Spacer()
         }
         .frame(maxWidth: .infinity)
+    }
+}
+
+/// 空白页的图标：一块视频画面，中间是播放键，底部两条字幕
+struct VideoCaptionGlyph: View {
+    var body: some View {
+        GeometryReader { g in
+            let w = g.size.width, h = g.size.height
+            ZStack {
+                RoundedRectangle(cornerRadius: h * 0.16)
+                    .stroke(accent, lineWidth: max(3, w * 0.045))
+                Image(systemName: "play.fill")
+                    .font(.system(size: h * 0.26))
+                    .foregroundStyle(accent)
+                    .offset(x: w * 0.02, y: -h * 0.12)
+                VStack(spacing: h * 0.07) {
+                    Capsule().fill(accent).frame(width: w * 0.62, height: h * 0.075)
+                    Capsule().fill(accent.opacity(0.55)).frame(width: w * 0.42, height: h * 0.075)
+                }
+                .offset(y: h * 0.27)
+            }
+        }
     }
 }
 
