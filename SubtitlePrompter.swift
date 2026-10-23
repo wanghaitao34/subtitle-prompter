@@ -474,13 +474,46 @@ final class Engine: ObservableObject {
 
     // MARK: 控制
 
+    /// 从头开始（还没到第一句）时先等这么多秒，给人看清第一句、准备开口
+    static let leadInLength = 2.0
+    /// 预备倒数的结束时刻；倒数期间时间停在原处，倒数完才真正开始走
+    @Published private(set) var leadInEnd: Date?
+    private var leadInToken = UUID()
+
+    var leadInRemaining: Double { max(0, leadInEnd?.timeIntervalSinceNow ?? 0) }
+
     func play() {
-        if time >= duration - 0.05 { seek(0) }
-        if let p = player { p.playImmediately(atRate: rate) } else { manualStart = Date() }
+        let atEnd = time >= duration - 0.05
+        if atEnd { seek(0) }
         isPlaying = true
+        // 还没念到第一句（含刚播完重来）：先倒数 2 秒
+        if atEnd || time <= (cues.first?.start ?? 0) + 0.05 {
+            let token = UUID()
+            leadInToken = token
+            leadInEnd = Date().addingTimeInterval(Engine.leadInLength)
+            DispatchQueue.main.asyncAfter(deadline: .now() + Engine.leadInLength) { [weak self] in
+                guard let self, self.leadInToken == token, self.leadInEnd != nil else { return }
+                self.endLeadIn()
+            }
+        } else {
+            startClock()
+        }
+    }
+
+    /// 结束倒数，真正开始走
+    private func endLeadIn() {
+        leadInEnd = nil
+        leadInToken = UUID()
+        if isPlaying { startClock() }
+    }
+
+    private func startClock() {
+        if let p = player { p.playImmediately(atRate: rate) } else { manualStart = Date() }
     }
 
     func pause() {
+        leadInEnd = nil
+        leadInToken = UUID()
         if let p = player { p.pause() } else if manualStart != nil { manualBase = time; manualStart = nil }
         isPlaying = false
     }
@@ -489,6 +522,7 @@ final class Engine: ObservableObject {
 
     func seek(_ t: Double) {
         let t = max(0, min(t, duration))
+        if leadInEnd != nil && t > 0.05 { endLeadIn() }
         if let p = player {
             p.seek(to: CMTime(seconds: t, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
                 DispatchQueue.main.async { self?.refresh += 1 }
@@ -500,10 +534,15 @@ final class Engine: ObservableObject {
         }
     }
 
-    /// 跳到下一句开头（提前 1 秒，好看到倒数）
+    /// 跳到下一句。正在念一句时，跳到下一句前 1 秒（好看到倒数）；
+    /// 已经在停顿里时，直接跳到下一句开头，不再回到停顿的开头
     func nextLine() {
+        // 预备倒数中按 →：跳过倒数，马上开始
+        if leadInEnd != nil { endLeadIn(); return }
         let t = time
-        if let i = cues.firstIndex(where: { $0.start > t + 0.05 }) { seek(cues[i].start - preroll(i)) }
+        guard let i = cues.firstIndex(where: { $0.start > t + 0.05 }) else { return }
+        let target = cues[i].start - preroll(i)
+        seek(activeIndex(at: t) == nil || target <= t + 0.05 ? cues[i].start : target)
     }
 
     /// 当前句播了超过 1 秒就回到本句开头，否则回到上一句
@@ -742,10 +781,12 @@ struct LyricsList: View {
     let time: Double
 
     var body: some View {
-        let active = e.activeIndex(at: time)
-        let next = e.nextIndex(at: time)
+        // 预备倒数期间：还没开始念，当前这句也算「下一句」，前面显示一段停顿条
+        let lead = e.leadInRemaining
+        let active = lead > 0 ? nil : e.activeIndex(at: time)
+        let next = lead > 0 ? (e.activeIndex(at: time) ?? e.nextIndex(at: time)) : e.nextIndex(at: time)
         // 停在两句之间、且这段停顿有单独一行时，镜头对准停顿行
-        let focus = active ?? next.map { gap(before: $0) >= minGap ? gapID($0) : $0 } ?? max(e.cues.count - 1, 0)
+        let focus = active ?? next.map { lead > 0 || gap(before: $0) >= minGap ? gapID($0) : $0 } ?? max(e.cues.count - 1, 0)
 
         GeometryReader { geo in
         // 一行最多能放多宽（减掉左右边距），超过就拆成两行
@@ -756,7 +797,15 @@ struct LyricsList: View {
                     Color.clear.frame(height: 240)
                     ForEach(e.cues) { cue in
                         let g = gap(before: cue.id)
-                        if g >= minGap {
+                        if lead > 0 && cue.id == next {
+                            // 预备倒数：2 秒加上离这句开口还剩的时间
+                            let wait = max(cue.start - time, 0)
+                            GapRow(duration: Engine.leadInLength + wait,
+                                   remaining: lead + wait,
+                                   isPast: false,
+                                   fontSize: fontSize)
+                                .id(gapID(cue.id))
+                        } else if g >= minGap {
                             let gapStart = cue.start - g
                             GapRow(duration: g,
                                    remaining: (time >= gapStart && time < cue.start) ? cue.start - time : nil,

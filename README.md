@@ -7,7 +7,7 @@
 <p align="center">把 SRT 字幕变成会跟着时间走的提词器，配音、录口播时照着念就行。</p>
 
 <p align="center">
-  <a href="https://github.com/wanghaitao34/subtitle-prompter/releases/latest/download/SubtitlePrompter-1.1.1.dmg"><b>⬇︎ 下载 macOS 版（1.1.1）</b></a>
+  <a href="https://github.com/wanghaitao34/subtitle-prompter/releases/latest/download/SubtitlePrompter-1.1.2.dmg"><b>⬇︎ 下载 macOS 版（1.1.2）</b></a>
 </p>
 
 ---
@@ -23,7 +23,7 @@
 
 ## 安装
 
-1. 下载 [字幕提词器 1.1.1](https://github.com/wanghaitao34/subtitle-prompter/releases/latest/download/SubtitlePrompter-1.1.1.dmg)。
+1. 下载 [字幕提词器 1.1.2](https://github.com/wanghaitao34/subtitle-prompter/releases/latest/download/SubtitlePrompter-1.1.2.dmg)。
 2. 双击打开下载的 DMG 文件，把「字幕提词器」拖进「应用程序」文件夹。
 3. 在「应用程序」里双击打开。第一次打开时，系统会问你「是否要打开从互联网下载的 App」，点「打开」就行。
 
@@ -57,9 +57,11 @@ App 已经通过苹果公证，不会出现「无法验证开发者」的警告�
 | 操作 | 方法 |
 |---|---|
 | 播放 / 暂停 | 空格键，或点下方中间的大圆按钮 |
-| 上一句 / 下一句 | ← / → 方向键（会提前 1 秒，方便你准备） |
+| 上一句 / 下一句 | ← / → 方向键（会提前 1 秒，方便你准备；停顿中按 → 直接跳到下一句） |
 | 跳到某一句 | 直接点那句字幕 |
 | 拖动进度 | 拖下方的进度条 |
+
+从头开始播放（或播完再按空格）时，会先等 **2 秒**，第一句前面会出现一根倒数横条，方便你看清第一句、准备开口。
 
 ### 4. 右上角的按钮
 
